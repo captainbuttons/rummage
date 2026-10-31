@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Rummage Sale POS</title>
+<script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+<style>
+*{box-sizing:border-box}body{font-family:system-ui,Arial,sans-serif;margin:0;background:#f4f4f4;color:#222}
+header{background:#2e7d32;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center}
+header button{background:#1b5e20;color:#fff;font-size:13px;padding:6px 8px}
+section{background:#fff;margin:8px;padding:10px;border-radius:8px}
+button{font-size:16px;padding:10px;border:0;border-radius:6px;background:#ddd}
+.row{display:flex;gap:6px}.row input{flex:1;font-size:18px;padding:8px;min-width:0}
+#manual{text-transform:uppercase}.primary{background:#2e7d32;color:#fff}.danger{background:#c62828;color:#fff}
+#vwrap{position:relative;display:none;background:#000;border-radius:6px;overflow:hidden}
+video{width:100%;display:block;max-height:45vh;object-fit:cover}
+#aim{position:absolute;left:8%;right:8%;top:38%;bottom:38%;border:2px solid #4caf50;border-radius:6px;pointer-events:none}
+table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-bottom:1px solid #eee}td.p{text-align:right;white-space:nowrap}
+.tot{font-size:26px;font-weight:bold;text-align:right}
+#msg{position:sticky;top:0;z-index:5;padding:10px;display:none;font-weight:bold;text-align:center}
+.warn{background:#ffe0b2;color:#8a4b00}.err{background:#ffcdd2;color:#b71c1c}.ok{background:#c8e6c9;color:#1b5e20}
+.keys{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.keys button{font-size:22px;padding:14px}
+.quick{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin:6px 0}.quick button{padding:10px 2px;background:#bbdefb}
+#tend{font-size:28px;text-align:right;padding:6px;border:1px solid #ccc;border-radius:6px;background:#fafafa}
+#change{font-size:30px;font-weight:bold;text-align:right}small{color:#666}
+</style></head><body>
+<header><b>Rummage Sale POS</b><button onclick="showSetup(true)">Settings</button></header>
+<div id="msg"></div>
+<section id="setup" style="display:none">
+  <b>Setup</b><br><small>Paste your Apps Script web app URL (ends in /exec). Saved on this phone only.</small>
+  <div class="row" style="margin-top:6px"><input id="apiIn" placeholder="https://script.google.com/macros/s/.../exec"></div>
+  <div class="row" style="margin-top:6px"><button class="primary" style="flex:1" onclick="saveApi()">Save &amp; test</button><button onclick="showSetup(false)">Close</button></div>
+  <small id="engine"></small>
+</section>
+<section>
+  <div id="vwrap"><video id="video" playsinline muted></video><div id="aim"></div></div>
+  <div class="row" style="margin-top:6px">
+    <button id="camBtn" class="primary" style="flex:1" onclick="toggleCam()">Start camera</button>
+    <button id="torchBtn" style="display:none" onclick="toggleTorch()">Torch</button>
+    <button onclick="document.getElementById('photo').click()">Photo</button>
+    <input id="photo" type="file" accept="image/*" capture="environment" style="display:none" onchange="scanFile(this)">
+  </div>
+  <div class="row" style="margin-top:6px">
+    <input id="manual" placeholder="Type code e.g. RS0001" autocapitalize="characters" onkeydown="if(event.key==='Enter')manualAdd()">
+    <button class="primary" onclick="manualAdd()">Add</button>
+  </div>
+</section>
+<section><table id="cart"></table><div class="tot">Total: <span id="total">$0.00</span></div></section>
+<section>
+  <div>Cash tendered</div><div id="tend">$0.00</div>
+  <div class="quick">
+    <button onclick="quick(1)">$1</button><button onclick="quick(5)">$5</button><button onclick="quick(10)">$10</button>
+    <button onclick="quick(20)">$20</button><button onclick="quick(50)">$50</button><button onclick="quick(100)">$100</button>
+  </div>
+  <div class="keys">
+    <button onclick="key('7')">7</button><button onclick="key('8')">8</button><button onclick="key('9')">9</button>
+    <button onclick="key('4')">4</button><button onclick="key('5')">5</button><button onclick="key('6')">6</button>
+    <button onclick="key('1')">1</button><button onclick="key('2')">2</button><button onclick="key('3')">3</button>
+    <button onclick="key('00')">00</button><button onclick="key('0')">0</button><button onclick="key('C')">C</button>
+    <button onclick="exact()" style="grid-column:span 3">Exact amount</button>
+  </div>
+  <div id="change">Change: $0.00</div>
+  <div class="row" style="margin-top:8px">
+    <button class="danger" onclick="clearSale()">Clear</button>
+    <button id="coBtn" class="primary" style="flex:1;font-size:20px" onclick="doCheckout()">Checkout</button>
+  </div>
+</section>
+<script>
+var cart = [], cents = 0, stream = null, track = null, scanning = false, torchOn = false, busy = false;
+var lastScan = {code: '', t: 0}, detector = null, zxReader = null, zxHintsReader = null;
+var canvas = document.createElement('canvas'), ctx = canvas.getContext('2d', {willReadFrequently: true});
+function $(id) { return document.getElementById(id); }
+function money(n) { return '$' + (Number(n) || 0).toFixed(2); }
+function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function show(text, cls) { var m = $('msg'); m.textContent = text; m.className = cls; m.style.display = 'block';
+  clearTimeout(show.t); show.t = setTimeout(function () { m.style.display = 'none'; }, 4000); }
+function beep(ok) { try { var a = beep.a || (beep.a = new (window.AudioContext || window.webkitAudioContext)()), o = a.createOscillator();
+  o.frequency.value = ok ? 880 : 220; o.connect(a.destination); o.start(); o.stop(a.currentTime + 0.15); } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate(ok ? 60 : [80, 60, 80]); }
+
+/* ---------- API config ---------- */
+function getApi() { return localStorage.getItem('rsApi') || ''; }
+(function initApi() {
+  var q = new URLSearchParams(location.search).get('api');
+  if (q && /^https:\/\/script\.google(usercontent)?\.com\//.test(q)) localStorage.setItem('rsApi', q.trim());
+  if (!getApi()) showSetup(true);
+})();
+function showSetup(v) { $('setup').style.display = v ? 'block' : 'none'; $('apiIn').value = getApi(); }
+function saveApi() {
+  var u = $('apiIn').value.trim();
+  if (!/^https:\/\/script\.google(usercontent)?\.com\/.+\/exec/.test(u)) { show('URL should look like https://script.google.com/macros/s/.../exec', 'err'); return; }
+  localStorage.setItem('rsApi', u);
+  api({action: 'ping'}).then(function () { show('Connected!', 'ok'); showSetup(false); })
+    .catch(function (e) { show('Could not reach API: ' + e.message, 'err'); });
+}
+/* GET via fetch (Apps Script redirects to googleusercontent, CORS allowed); JSONP fallback. */
+function api(params) {
+  var base = getApi(); if (!base) return Promise.reject(new Error('Set the API URL in Settings'));
+  var qs = Object.keys(params).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]); }).join('&');
+  var url = base + (base.indexOf('?') < 0 ? '?' : '&') + qs + '&_=' + Date.now();
+  return fetch(url, {redirect: 'follow'}).then(function (r) { return r.json(); })
+    .catch(function () { return jsonp(url); })
+    .then(function (d) { if (d && d.error) throw new Error(d.error); return d; });
+}
+function jsonp(url) {
+  return new Promise(function (res, rej) {
+    var cb = 'rsCb' + Date.now() + Math.floor(Math.random() * 1000), s = document.createElement('script');
+    var t = setTimeout(function () { cleanup(); rej(new Error('Network timeout')); }, 20000);
+    function cleanup() { clearTimeout(t); delete window[cb]; s.remove(); }
+    window[cb] = function (d) { cleanup(); res(d); };
+    s.onerror = function () { cleanup(); rej(new Error('Network error (check URL and deployment access)')); };
+    s.src = url + '&callback=' + cb; document.head.appendChild(s);
+  });
+}
+/* Checkout uses POST text/plain (no CORS preflight); falls back to GET/JSONP. */
+function apiPost(body) {
+  var base = getApi();
+  return fetch(base, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body), redirect: 'follow'})
+    .then(function (r) { return r.json(); })
+    .then(function (d) { if (d && d.error) throw new Error(d.error); return d; }, function () {
+      return api({action: body.action, codes: body.codes.join(','), tendered: body.tendered}); });
+}
+
+/* ---------- Cart / cash ---------- */
+function total() { return Math.round(cart.reduce(function (s, i) { return s + i.price; }, 0) * 100) / 100; }
+function render() {
+  $('cart').innerHTML = cart.map(function (it, i) {
+    return '<tr><td><b>' + esc(it.code) + '</b><br>' + esc(it.description) + '</td><td class="p">' + money(it.price) +
+      '</td><td><button class="danger" onclick="removeLine(' + i + ')">X</button></td></tr>'; }).join('') ||
+    '<tr><td style="color:#888">Cart empty - scan an item</td></tr>';
+  $('total').textContent = money(total()); $('tend').textContent = money(cents / 100);
+  var ch = cents / 100 - total();
+  $('change').textContent = ch < 0 ? 'Still owed: ' + money(-ch) : 'Change: ' + money(ch);
+  $('change').style.color = ch < 0 ? '#c62828' : '#1b5e20';
+}
+function removeLine(i) { cart.splice(i, 1); render(); }
+function addCode(code) {
+  code = String(code || '').trim().toUpperCase(); if (!code) return;
+  if (cart.some(function (c) { return c.code === code; })) { beep(false); show(code + ' is already in the cart', 'warn'); return; }
+  show('Looking up ' + code + '...', 'warn');
+  api({action: 'lookup', code: code}).then(function (r) {
+    if (!r.found) { beep(false); show('Item ' + code + ' NOT FOUND', 'err'); return; }
+    if (r.item.status === 'Sold') { beep(false); show(code + ' is ALREADY SOLD (' + r.item.soldAt + ')', 'err'); return; }
+    if (cart.some(function (c) { return c.code === code; })) return;
+    cart.push(r.item); beep(true); show('Added ' + code + ' ' + money(r.item.price), 'ok'); render();
+  }).catch(function (e) { show('Error: ' + e.message, 'err'); });
+}
+function manualAdd() { addCode($('manual').value); $('manual').value = ''; }
+function key(k) { if (k === 'C') cents = 0; else { var s = String(cents) + k; if (s.length <= 7) cents = parseInt(s, 10); } render(); }
+function quick(d) { cents += d * 100; render(); }
+function exact() { cents = Math.round(total() * 100); render(); }
+function clearSale() { cart = []; cents = 0; render(); }
+function doCheckout() {
+  if (!cart.length) { show('Cart is empty', 'warn'); return; }
+  if (cents / 100 < total() && !confirm('Tendered is less than total. Checkout anyway?')) return;
+  $('coBtn').disabled = true;
+  apiPost({action: 'checkout', codes: cart.map(function (c) { return c.code; }), tendered: cents / 100}).then(function (r) {
+    if (!r.ok) { beep(false); show('Checkout blocked: ' + r.problems.join('; '), 'err'); return; }
+    beep(true); alert('Sale ' + r.saleId + '\nTotal ' + money(r.total) + '\nTendered ' + money(r.tendered) + '\nCHANGE ' + money(r.change));
+    clearSale();
+  }).catch(function (e) { show('Checkout error: ' + e.message, 'err'); })
+    .then(function () { $('coBtn').disabled = false; });
+}
+
+/* ---------- Decoders ---------- */
+function initDecoders() {
+  if (typeof ZXing !== 'undefined') {
+    var F = ZXing.BarcodeFormat, base = [F.CODE_128, F.CODE_39, F.EAN_13, F.UPC_A, F.QR_CODE];
+    var h1 = new Map(); h1.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, base);
+    zxReader = new ZXing.MultiFormatReader(); zxReader.setHints(h1);
+    var h2 = new Map(); h2.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, base); h2.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    zxHintsReader = new ZXing.MultiFormatReader(); zxHintsReader.setHints(h2);
+  }
+  var p = Promise.resolve();
+  if ('BarcodeDetector' in window) {
+    p = BarcodeDetector.getSupportedFormats().then(function (f) {
+      if (f.indexOf('code_128') >= 0) detector = new BarcodeDetector({formats: ['code_128', 'code_39', 'ean_13', 'upc_a', 'qr_code'].filter(function (x) { return f.indexOf(x) >= 0; })});
+    }).catch(function () {});
+  }
+  return p.then(function () { $('engine').textContent = 'Scanner: ' + (detector ? 'native BarcodeDetector' : '') + (detector && zxReader ? ' + ' : '') + (zxReader ? 'ZXing' : ''); });
+}
+var decodersReady = initDecoders();
+function zxDecodeCanvas(c, hard) {
+  var r = hard ? zxHintsReader : zxReader; if (!r) return null;
+  try {
+    var lum = new ZXing.HTMLCanvasElementLuminanceSource(c);
+    var res = r.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum)));
+    return res && res.getText();
+  } catch (e) { return null; } finally { try { r.reset(); } catch (e) {} }
+}
+function nativeDecode(src) {
+  if (!detector) return Promise.resolve(null);
+  return detector.detect(src).then(function (b) { return b.length ? b[0].rawValue : null; }).catch(function () { return null; });
+}
+
+/* ---------- Live camera ---------- */
+function toggleCam() { if (scanning) stopCam(); else startCam(); }
+function startCam() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { show('Camera API not available. Use HTTPS (GitHub Pages) and a modern browser.', 'err'); return; }
+  navigator.mediaDevices.getUserMedia({audio: false, video: {facingMode: {ideal: 'environment'}, width: {ideal: 1920, min: 1280}, height: {ideal: 1080, min: 720}}})
+    .catch(function () { return navigator.mediaDevices.getUserMedia({audio: false, video: {facingMode: {ideal: 'environment'}, width: {ideal: 1280}, height: {ideal: 720}}}); })
+    .then(function (s) {
+      stream = s; track = s.getVideoTracks()[0];
+      var v = $('video'); v.srcObject = s; $('vwrap').style.display = 'block';
+      return v.play().then(function () {
+        var caps = track.getCapabilities ? track.getCapabilities() : {};
+        var adv = [];
+        if (caps.focusMode && caps.focusMode.indexOf('continuous') >= 0) adv.push({focusMode: 'continuous'});
+        if (caps.zoom && caps.zoom.max >= 1.5) adv.push({zoom: Math.min(2, caps.zoom.max)});
+        if (adv.length) track.applyConstraints({advanced: adv}).catch(function () {});
+        $('torchBtn').style.display = caps.torch ? 'block' : 'none';
+        scanning = true; $('camBtn').textContent = 'Stop camera';
+        return decodersReady;
+      }).then(loop);
+    }).catch(function (e) { show('Camera unavailable: ' + (e.message || e) + '. Allow camera permission for this site, or use Photo / type code.', 'err'); });
+}
+function stopCam() {
+  scanning = false; if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+  stream = track = null; torchOn = false; $('vwrap').style.display = 'none'; $('torchBtn').style.display = 'none'; $('camBtn').textContent = 'Start camera';
+}
+function toggleTorch() {
+  if (!track) return; torchOn = !torchOn;
+  track.applyConstraints({advanced: [{torch: torchOn}]}).catch(function () { show('Torch not supported', 'warn'); });
+}
+var frameN = 0;
+function loop() {
+  if (!scanning) return;
+  if (busy) { requestAnimationFrame(loop); return; }
+  var v = $('video');
+  if (v.readyState < 2) { requestAnimationFrame(loop); return; }
+  busy = true; frameN++;
+  nativeDecode(v).then(function (txt) {
+    if (txt || !zxReader) return txt;
+    // ZXing: center band (where the aim box is), full res; every 3rd frame the full frame.
+    var w = v.videoWidth, h = v.videoHeight, full = frameN % 3 === 0;
+    var sx = full ? 0 : Math.round(w * 0.05), sw = full ? w : Math.round(w * 0.9);
+    var sy = full ? 0 : Math.round(h * 0.3), sh = full ? h : Math.round(h * 0.4);
+    var scale = Math.min(1, 1280 / sw);
+    canvas.width = Math.round(sw * scale); canvas.height = Math.round(sh * scale);
+    ctx.drawImage(v, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+    return zxDecodeCanvas(canvas, false);
+  }).then(function (txt) {
+    busy = false;
+    if (txt) { var now = Date.now();
+      if (!(txt === lastScan.code && now - lastScan.t < 2500)) { lastScan = {code: txt, t: now}; addCode(txt); } }
+    setTimeout(function () { requestAnimationFrame(loop); }, detector ? 60 : 120);
+  });
+}
+
+/* ---------- Photo scanning: native, then ZXing at several sizes/rotations with TRY_HARDER ---------- */
+function scanFile(inp) {
+  var f = inp.files && inp.files[0]; if (!f) return;
+  show('Reading photo...', 'warn');
+  var img = new Image(), url = URL.createObjectURL(f);
+  img.onload = function () {
+    decodersReady.then(function () { return nativeDecode(img); }).then(function (txt) {
+      if (txt) return txt;
+      var sizes = [1600, 1200, 800, 2400], rots = [0, 90, 180, 270];
+      for (var i = 0; i < sizes.length; i++) for (var j = 0; j < rots.length; j++) {
+        var c = drawRot(img, sizes[i], rots[j]);
+        var t = zxDecodeCanvas(c, true); if (t) return t;
+        if (rots[j] === 0) { // also try the middle band and a high-contrast copy
+          t = zxDecodeCanvas(crop(c, 0.25), true) || zxDecodeCanvas(contrast(c), true); if (t) return t; }
+      }
+      return null;
+    }).then(function (txt) {
+      URL.revokeObjectURL(url); inp.value = '';
+      if (txt) addCode(txt); else { beep(false); show('No barcode found. Fill the frame with the tag, hold steady, good light - or type the code.', 'err'); }
+    });
+  };
+  img.onerror = function () { show('Could not open photo', 'err'); inp.value = ''; };
+  img.src = url;
+}
+function drawRot(img, maxDim, deg) {
+  var s = Math.min(1, maxDim / Math.max(img.naturalWidth, img.naturalHeight));
+  var w = Math.round(img.naturalWidth * s), h = Math.round(img.naturalHeight * s), c = document.createElement('canvas');
+  var sw = deg % 180 ? h : w, sh = deg % 180 ? w : h; c.width = sw; c.height = sh;
+  var x = c.getContext('2d'); x.translate(sw / 2, sh / 2); x.rotate(deg * Math.PI / 180); x.drawImage(img, -w / 2, -h / 2, w, h);
+  return c;
+}
+function crop(c, frac) {
+  var o = document.createElement('canvas'), y = Math.round(c.height * frac);
+  o.width = c.width; o.height = c.height - 2 * y; o.getContext('2d').drawImage(c, 0, y, c.width, o.height, 0, 0, c.width, o.height); return o;
+}
+function contrast(c) {
+  var o = document.createElement('canvas'); o.width = c.width; o.height = c.height;
+  var x = o.getContext('2d'); x.filter = 'grayscale(1) contrast(1.8)'; x.drawImage(c, 0, 0); return o;
+}
+render();
+</script></body></html>
