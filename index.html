@@ -44,6 +44,21 @@ table{width:100%;border-collapse:collapse}td{padding:6px 4px;border-bottom:1px s
     <button class="primary" onclick="manualAdd()">Add</button>
   </div>
 </section>
+<section>
+  <button id="custBtn" style="width:100%;background:#fff3e0" onclick="toggleCustom()">+ Custom item (no sticker)</button>
+  <div id="custPanel" style="display:none;margin-top:8px">
+    <div id="custPrice" style="font-size:32px;text-align:right;padding:6px;border:2px solid #ef6c00;border-radius:6px">$0.00</div>
+    <div class="keys" style="margin-top:6px">
+      <button onclick="ckey('7')">7</button><button onclick="ckey('8')">8</button><button onclick="ckey('9')">9</button>
+      <button onclick="ckey('4')">4</button><button onclick="ckey('5')">5</button><button onclick="ckey('6')">6</button>
+      <button onclick="ckey('1')">1</button><button onclick="ckey('2')">2</button><button onclick="ckey('3')">3</button>
+      <button onclick="ckey('00')">00</button><button onclick="ckey('0')">0</button><button onclick="ckey('C')">C</button>
+    </div>
+    <div class="row" style="margin-top:6px"><input id="custDesc" placeholder="Description (optional)" maxlength="60"></div>
+    <div class="row" style="margin-top:6px"><button onclick="toggleCustom()">Cancel</button>
+      <button class="primary" style="flex:1" onclick="addCustom()">Add custom item</button></div>
+  </div>
+</section>
 <section><table id="cart"></table><div class="tot">Total: <span id="total">$0.00</span></div></section>
 <section>
   <div>Cash tendered</div><div id="tend">$0.00</div>
@@ -117,7 +132,7 @@ function apiPost(body) {
   return fetch(base, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body), redirect: 'follow'})
     .then(function (r) { return r.json(); })
     .then(function (d) { if (d && d.error) throw new Error(d.error); return d; }, function () {
-      return api({action: body.action, codes: body.codes.join(','), tendered: body.tendered}); });
+      return api({action: body.action, codes: body.codes.join(','), tendered: body.tendered, extras: JSON.stringify(body.extras || [])}); });
 }
 
 /* ---------- Cart / cash ---------- */
@@ -132,15 +147,28 @@ function render() {
   $('change').textContent = ch < 0 ? 'Still owed: ' + money(-ch) : 'Change: ' + money(ch);
   $('change').style.color = ch < 0 ? '#c62828' : '#1b5e20';
 }
+var custCents = 0;
+function toggleCustom(force) {
+  var p = $('custPanel'), open = force === undefined ? p.style.display === 'none' : force;
+  p.style.display = open ? 'block' : 'none'; custCents = 0; $('custDesc').value = ''; $('custPrice').textContent = money(0);
+}
+function ckey(k) { if (k === 'C') custCents = 0; else { var s = String(custCents) + k; if (s.length <= 7) custCents = parseInt(s, 10); }
+  $('custPrice').textContent = money(custCents / 100); }
+function addCustom() {
+  if (custCents <= 0) { show('Enter a price for the custom item', 'warn'); return; }
+  var d = $('custDesc').value.trim() || 'Custom item';
+  cart.push({code: 'CUSTOM', custom: true, description: d, price: custCents / 100});
+  beep(true); show('Added custom ' + money(custCents / 100), 'ok'); toggleCustom(false); render();
+}
 function removeLine(i) { cart.splice(i, 1); render(); }
 function addCode(code) {
   code = String(code || '').trim().toUpperCase(); if (!code) return;
-  if (cart.some(function (c) { return c.code === code; })) { beep(false); show(code + ' is already in the cart', 'warn'); return; }
+  if (cart.some(function (c) { return !c.custom && c.code === code; })) { beep(false); show(code + ' is already in the cart', 'warn'); return; }
   show('Looking up ' + code + '...', 'warn');
   api({action: 'lookup', code: code}).then(function (r) {
     if (!r.found) { beep(false); show('Item ' + code + ' NOT FOUND', 'err'); return; }
     if (r.item.status === 'Sold') { beep(false); show(code + ' is ALREADY SOLD (' + r.item.soldAt + ')', 'err'); return; }
-    if (cart.some(function (c) { return c.code === code; })) return;
+    if (cart.some(function (c) { return !c.custom && c.code === code; })) return;
     cart.push(r.item); beep(true); show('Added ' + code + ' ' + money(r.item.price), 'ok'); render();
   }).catch(function (e) { show('Error: ' + e.message, 'err'); });
 }
@@ -151,14 +179,34 @@ function exact() { cents = Math.round(total() * 100); render(); }
 function clearSale() { cart = []; cents = 0; render(); }
 function doCheckout() {
   if (!cart.length) { show('Cart is empty', 'warn'); return; }
-  if (cents / 100 < total() && !confirm('Tendered is less than total. Checkout anyway?')) return;
-  $('coBtn').disabled = true;
-  apiPost({action: 'checkout', codes: cart.map(function (c) { return c.code; }), tendered: cents / 100}).then(function (r) {
-    if (!r.ok) { beep(false); show('Checkout blocked: ' + r.problems.join('; '), 'err'); return; }
-    beep(true); alert('Sale ' + r.saleId + '\nTotal ' + money(r.total) + '\nTendered ' + money(r.tendered) + '\nCHANGE ' + money(r.change));
+  var tot = total(), tend = cents / 100;
+  if (tend < tot && !confirm('Tendered is less than total. Checkout anyway?')) return;
+  var codes = cart.filter(function (c) { return !c.custom; }).map(function (c) { return c.code; });
+  var extras = cart.filter(function (c) { return c.custom; }).map(function (c) { return {description: c.description, price: c.price}; });
+  var exTot = Math.round(extras.reduce(function (a, x) { return a + x.price; }, 0) * 100) / 100;
+  var change = Math.round((tend - tot) * 100) / 100;
+  function done(r, note) {
+    beep(true);
+    alert((r ? 'Sale ' + r.saleId + '\n' : '') + 'Total ' + money(tot) + (exTot ? '  (incl. custom ' + money(exTot) + ')' : '') +
+      '\nTendered ' + money(tend) + '\nCHANGE ' + money(change) + (note ? '\n\n' + note : ''));
     clearSale();
-  }).catch(function (e) { show('Checkout error: ' + e.message, 'err'); })
-    .then(function () { $('coBtn').disabled = false; });
+  }
+  $('coBtn').disabled = true;
+  var p;
+  if (!codes.length) {
+    // Custom-only sale. New server logs it; old server rejects an empty code list -> finish locally.
+    p = apiPost({action: 'checkout', codes: [], tendered: tend, extras: extras}).then(function (r) {
+      if (r && r.ok && r.extrasTotal !== undefined) done(r);
+      else done(null, 'Custom-only sale NOT logged in the sheet (update Apps Script to log custom items).');
+    }, function () { done(null, 'Custom-only sale NOT logged in the sheet (update Apps Script to log custom items).'); });
+  } else {
+    p = apiPost({action: 'checkout', codes: codes, tendered: tend, extras: extras}).then(function (r) {
+      if (!r.ok) { beep(false); show('Checkout blocked: ' + r.problems.join('; '), 'err'); return; }
+      var logged = r.extrasTotal !== undefined;
+      done(r, exTot && !logged ? 'Sheet logged stickered items ' + money(r.total) + ' only; custom ' + money(exTot) + ' not logged (old Apps Script).' : '');
+    }).catch(function (e) { show('Checkout error: ' + e.message, 'err'); });
+  }
+  p.then(function () { $('coBtn').disabled = false; });
 }
 
 /* ---------- Decoders ---------- */
